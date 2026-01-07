@@ -11,7 +11,7 @@ Yi Qu, Senming Zhong, Minglong Xue
 - Create Conda Environment
 ```
 conda env create -f environment.yaml
-conda activate diff_retinex_plus_env
+conda activate qy
 ```
 - Install BasicSR
 ```
