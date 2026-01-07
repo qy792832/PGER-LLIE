@@ -5,7 +5,7 @@
 Yi Qu, Senming Zhong, Minglong Xue
 
 
-![Framework](asserts/framework.png)
+![Framework](image/kuangjian.png)
 
 ## 1. Create Environment
 - Create Conda Environment
