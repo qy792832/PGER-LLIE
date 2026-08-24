@@ -15,18 +15,18 @@ from PIL import Image
 
 import utils
 from models.unet import DiffusionUNet
-from models.decom import CTDN
+from models.decom import RICD, ReconstructionDecoder
 from models.pgfm import PGFM
 from models.ceg import CEG
 
 
 def _save_ckpt_exact(state: dict, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(state, path)  # 不做任何二次命名
+    torch.save(state, path)  # ä¸åšä»»ä½•äºŒæ¬¡å‘½å
 
 
 # =========================
-# 工具：图像/PSNR/EMA 验证上下文
+# å·¥å…·ï¼šå›¾åƒ/PSNR/EMA éªŒè¯ä¸Šä¸‹æ–‡
 # =========================
 def _to_tensor_rgb01(img: Image.Image) -> torch.Tensor:
     """PIL -> Tensor [C,H,W], 0~1"""
@@ -37,7 +37,7 @@ def _to_tensor_rgb01(img: Image.Image) -> torch.Tensor:
 
 @torch.no_grad()
 def _load_gt_tensor(y_item: Union[str, os.PathLike], gt_root: str) -> torch.Tensor:
-    """y_item 可能是文件名或相对路径；gt_root 通常是 val_dir/high 或 val_dir。"""
+    """y_item å¯èƒ½æ˜¯æ–‡ä»¶åæˆ–ç›¸å¯¹è·¯å¾„ï¼›gt_root é€šå¸¸æ˜¯ val_dir/high æˆ– val_dirã€‚"""
     cand = str(y_item)
     if not os.path.isabs(cand):
         cand = os.path.join(gt_root, cand)
@@ -64,7 +64,7 @@ def _batch_psnr(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-10) -> tor
 
 
 class _EMAEvalCtx:
-    """with _EMAEvalCtx(self.ema_helper, self.model): 切到 EMA 权重做验证，退出后自动恢复"""
+    """with _EMAEvalCtx(self.ema_helper, self.model): åˆ‡åˆ° EMA æƒé‡åšéªŒè¯ï¼Œé€€å‡ºåŽè‡ªåŠ¨æ¢å¤"""
 
     def __init__(self, ema_helper, model):
         self.ema = ema_helper
@@ -75,7 +75,7 @@ class _EMAEvalCtx:
     def __enter__(self):
         if not self.enabled:
             return self
-        # 兼容两类 EMA 接口
+        # å…¼å®¹ä¸¤ç±» EMA æŽ¥å£
         if hasattr(self.ema, "store") and hasattr(self.ema, "copy_to"):
             self.ema.store(self.model.parameters())
             self.ema.copy_to(self.model.parameters())
@@ -150,7 +150,7 @@ class EMAHelper(object):
 
 
 # =========================
-# beta 调度
+# beta è°ƒåº¦
 # =========================
 def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_timesteps):
     def sigmoid(x):
@@ -177,7 +177,7 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
 
 
 # =========================
-# 主网络
+# ä¸»ç½‘ç»œ
 # =========================
 class Net(nn.Module):
     def __init__(self, args, config):
@@ -188,11 +188,22 @@ class Net(nn.Module):
 
         self.Unet = DiffusionUNet(config)
 
-        # 训练时从 stage1 初始化 decom；评估时权重从 ddm ckpt 里加载
-        if getattr(self.args, "mode", "training") == 'training':
-            self.decom = self.load_stage1(CTDN(), 'ckpt/stage1')
-        else:
-            self.decom = CTDN()
+        # Streamlined RICD teacher and separated reconstruction decoder
+        self.decom = RICD(channels=64)
+        self.recon_decoder = ReconstructionDecoder(channels=64)
+
+        # During Stage-II training, initialize both components from Stage-I CTDN
+        if getattr(self.args, "mode", "training") == "training":
+            self.load_stage1(
+                self.decom,
+                self.recon_decoder,
+                "ckpt/stage1",
+            )
+
+        # Both Stage-I components remain frozen during Stage II
+        for module in (self.decom, self.recon_decoder):
+            for param in module.parameters():
+                param.requires_grad = False
 
         betas = get_beta_schedule(
             beta_schedule=config.diffusion.beta_schedule,
@@ -204,22 +215,22 @@ class Net(nn.Module):
         self.betas = torch.from_numpy(betas).float()
         self.num_timesteps = self.betas.shape[0]
 
-        # ============ PGFM + CEG 模块 ============
+        # ============ PGFM + CEG æ¨¡å— ============
         base_ch = getattr(self.config.model, 'ch', 64)
         self.enc_x = nn.Sequential(nn.Conv2d(3, base_ch, 3, 1, 1), nn.GELU())
         self.dec_x = nn.Sequential(nn.Conv2d(base_ch, 3, 3, 1, 1))
         self.pgfm = PGFM(ch=base_ch).to(self.device)
         self.ceg = CEG(ch=base_ch, n_expert=4, topk=2).to(self.device)
 
-        # evaluation 模式下用于给中间图命名的计数器
+        # evaluation æ¨¡å¼ä¸‹ç”¨äºŽç»™ä¸­é—´å›¾å‘½åçš„è®¡æ•°å™¨
         self.debug_counter = 0
 
     @staticmethod
     def compute_alpha(beta: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         beta: [T]
-        t   : [B] ，包含时间步索引
-        返回 alpha_bar_t，形状 [B,1,1,1]
+        t   : [B] ï¼ŒåŒ…å«æ—¶é—´æ­¥ç´¢å¼•
+        è¿”å›ž alpha_bar_tï¼Œå½¢çŠ¶ [B,1,1,1]
         """
         if not torch.is_tensor(beta):
             beta = torch.as_tensor(beta, dtype=torch.float32)
@@ -229,19 +240,56 @@ class Net(nn.Module):
         return a
 
     @staticmethod
-    def load_stage1(model, model_dir):
+    def load_stage1(ricd, recon_decoder, model_dir):
         """
-        尝试优先加载绝对路径；否则从 model_dir 拼 'stage1_weight.pth.tar'
+        Load a full Stage-I CTDN checkpoint into the streamlined RICD
+        and the separated reconstruction decoder.
         """
-        abs_path = "/home/ubuntu/project1/LightenDiffusion-main/ckpt/stage1/stage1_weight.pth.tar"
-        cand_path = abs_path if os.path.isfile(abs_path) else os.path.join(
-            model_dir, "stage1_weight.pth.tar")
-        checkpoint = utils.logging.load_checkpoint(cand_path, 'cuda')
-        model.load_state_dict(checkpoint['model'], strict=True)
-        return model
+        checkpoint_path = os.path.join(
+            model_dir,
+            "stage1_weight.pth.tar",
+        )
+        checkpoint = utils.logging.load_checkpoint(
+            checkpoint_path,
+            "cuda",
+        )
+
+        state_dict = checkpoint.get(
+            "model",
+            checkpoint.get("state_dict", checkpoint),
+        )
+
+        normalized_state = {}
+        for key, value in state_dict.items():
+            if key.startswith("module."):
+                key = key[len("module."):]
+            normalized_state[key] = value
+
+        ricd_state = {}
+        decoder_state = {}
+
+        for key, value in normalized_state.items():
+            if (
+                key.startswith("ReconNet.pyramid.")
+                or key.startswith("ReconNet.channel_down.")
+                or key.startswith("retinex.")
+            ):
+                ricd_state[key] = value
+            elif key.startswith("ReconNet."):
+                decoder_key = key[len("ReconNet."):]
+                decoder_state[decoder_key] = value
+
+        ricd.load_state_dict(ricd_state, strict=True)
+        recon_decoder.load_state_dict(decoder_state, strict=True)
+
+        print(
+            "=> loaded Stage-I CTDN weights into streamlined "
+            "RICD and reconstruction decoder"
+        )
+
 
     # -------------------------------------
-    # 采样（训练 / 推理共用）：中间插 PGFM + CEG
+    # é‡‡æ ·ï¼ˆè®­ç»ƒ / æŽ¨ç†å…±ç”¨ï¼‰ï¼šä¸­é—´æ’ PGFM + CEG
     # -------------------------------------
     def sample_training(
         self,
@@ -252,15 +300,15 @@ class Net(nn.Module):
         noise_seed: int = 12345,
     ):
         """
-        x_cond: 条件特征 [B,C,H,W] （通常是 low_condition_norm）
-        low_img: 原始低光 RGB 图像 [B,3,H0,W0] ，用于 CTDN 分解提供先验
-        返回:
-          - 最终特征 pred_fea  (与 x_cond 分辨率一致)
-          - aux_accum: 聚合的正则项（张量）
+        x_cond: æ¡ä»¶ç‰¹å¾ [B,C,H,W] ï¼ˆé€šå¸¸æ˜¯ low_condition_normï¼‰
+        low_img: åŽŸå§‹ä½Žå…‰ RGB å›¾åƒ [B,3,H0,W0] ï¼Œç”¨äºŽ CTDN åˆ†è§£æä¾›å…ˆéªŒ
+        è¿”å›ž:
+          - æœ€ç»ˆç‰¹å¾ pred_fea  (ä¸Ž x_cond åˆ†è¾¨çŽ‡ä¸€è‡´)
+          - aux_accum: èšåˆçš„æ­£åˆ™é¡¹ï¼ˆå¼ é‡ï¼‰
         """
-        assert low_img is not None, "sample_training() 调用时请传 low_img=inputs"
+        assert low_img is not None, "sample_training() è°ƒç”¨æ—¶è¯·ä¼  low_img=inputs"
 
-        # 在函数内部统一构造 betas
+        # åœ¨å‡½æ•°å†…éƒ¨ç»Ÿä¸€æž„é€  betas
         b = self.betas.to(x_cond.device)
 
         skip = self.config.diffusion.num_diffusion_timesteps // self.config.diffusion.num_sampling_timesteps
@@ -268,7 +316,7 @@ class Net(nn.Module):
         n, c, h, w = x_cond.shape
         seq_next = [-1] + seq[:-1]
 
-        # —— 根据 deterministic 生成噪声 ——
+        # â€”â€” æ ¹æ® deterministic ç”Ÿæˆå™ªå£° â€”â€”
         if deterministic:
             g = torch.Generator(device=self.device)
             g.manual_seed(noise_seed)
@@ -277,14 +325,14 @@ class Net(nn.Module):
             x = torch.randn(n, c, h, w, device=self.device)
         xs = [x]
 
-        # 每隔多少个时间步启用一次“CTDN + PGFM + CEG”
+        # æ¯éš”å¤šå°‘ä¸ªæ—¶é—´æ­¥å¯ç”¨ä¸€æ¬¡â€œCTDN + PGFM + CEGâ€
         SKIP_FACTOR = 4
 
-        # 正则累计（张量，便于 DDP 聚合）
+        # æ­£åˆ™ç´¯è®¡ï¼ˆå¼ é‡ï¼Œä¾¿äºŽ DDP èšåˆï¼‰
         aux_accum = torch.zeros(1, device=x_cond.device)
 
         for step_idx, (i, j) in enumerate(zip(reversed(seq), reversed(seq_next))):
-            # i, j 都是 int（扩散时间步索引）
+            # i, j éƒ½æ˜¯ intï¼ˆæ‰©æ•£æ—¶é—´æ­¥ç´¢å¼•ï¼‰
             t = torch.full((n,), i, device=x.device, dtype=torch.long)
             next_t = torch.full((n,), j, device=x.device, dtype=torch.long)
 
@@ -292,11 +340,11 @@ class Net(nn.Module):
             at_next = self.compute_alpha(b, next_t)
             xt = xs[-1].to(x.device)
 
-            # 常规反推：预测噪声 et，得到当前步的 x0_t（[-1,1]）
+            # å¸¸è§„åæŽ¨ï¼šé¢„æµ‹å™ªå£° etï¼Œå¾—åˆ°å½“å‰æ­¥çš„ x0_tï¼ˆ[-1,1]ï¼‰
             et = self.Unet(torch.cat([x_cond, xt], dim=1), t.float())
             x0_t = (xt - et * (1 - at).sqrt()) / at.sqrt()
 
-            # 先做一个粗筛：只有 i 能被 4 整除时才考虑用中间模块
+            # å…ˆåšä¸€ä¸ªç²—ç­›ï¼šåªæœ‰ i èƒ½è¢« 4 æ•´é™¤æ—¶æ‰è€ƒè™‘ç”¨ä¸­é—´æ¨¡å—
             use_mid_gate = (i % 4 == 0)
             if not use_mid_gate:
                 c1 = eta * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
@@ -305,17 +353,17 @@ class Net(nn.Module):
                 xs.append(xt_next.to(x.device))
                 continue
 
-            # 再用 SKIP_FACTOR 控制频率
+            # å†ç”¨ SKIP_FACTOR æŽ§åˆ¶é¢‘çŽ‡
             use_mid = (step_idx % SKIP_FACTOR == 0)
             if use_mid:
                 # [-1,1] -> [0,1]
                 x0_01 = torch.clamp((x0_t + 1) / 2.0, 0.0, 1.0)
 
-                # 低光 3 通道 & [0,1]
+                # ä½Žå…‰ 3 é€šé“ & [0,1]
                 low_rgb = low_img[:, :3, ...] if low_img.shape[1] >= 3 else low_img
                 low_01 = torch.clamp(low_rgb, 0.0, 1.0)
 
-                # 对齐到 x0 分辨率
+                # å¯¹é½åˆ° x0 åˆ†è¾¨çŽ‡
                 Hf, Wf = x0_01.shape[-2], x0_01.shape[-1]
                 if low_01.shape[-2:] != (Hf, Wf):
                     low_01 = F.interpolate(
@@ -323,13 +371,13 @@ class Net(nn.Module):
 
                 pair = torch.cat([low_01, x0_01], dim=1)  # [B,6,Hf,Wf]
 
-                # 教师分解（CTDN / RICD）
+                # æ•™å¸ˆåˆ†è§£ï¼ˆCTDN / RICDï¼‰
                 with torch.no_grad():
                     out_ctdn = self.decom(pair, pred_fea=None)
                     teacher_R = out_ctdn["high_R"]
                     teacher_L = out_ctdn["high_L"]
 
-                # L 单通道 → 3 通道；teacher 上采样到 (Hf, Wf)
+                # L å•é€šé“ â†’ 3 é€šé“ï¼›teacher ä¸Šé‡‡æ ·åˆ° (Hf, Wf)
                 if teacher_L.shape[1] == 1:
                     teacher_L = teacher_L.repeat(1, 3, 1, 1)
                 if teacher_R.shape[-2:] != (Hf, Wf):
@@ -344,18 +392,18 @@ class Net(nn.Module):
                 # ====== PGFM + CEG ======
                 feat_in = self.enc_x(x0_01)
 
-                # 先经过 PGFM
+                # å…ˆç»è¿‡ PGFM
                 feat_pgfm, loss_pgfm, _ = self.pgfm(
                     feat_in, teacher_R, teacher_L)
 
-                # 再经过 CEG
+                # å†ç»è¿‡ CEG
                 feat_ceg, loss_ceg = self.ceg(feat_pgfm, t_scalar=t.float())
 
-                # CEG 后结果映射回 [-1,1]
+                # CEG åŽç»“æžœæ˜ å°„å›ž [-1,1]
                 x0_ceg_01 = torch.clamp(self.dec_x(feat_ceg), 0.0, 1.0)
                 x0_refined = x0_ceg_01 * 2.0 - 1.0
 
-                # ====== 累计附加正则（兼容新旧 key） ======
+                # ====== ç´¯è®¡é™„åŠ æ­£åˆ™ï¼ˆå…¼å®¹æ–°æ—§ keyï¼‰ ======
                 # CEG keys: ceg_balance/ceg_sparsity (new) OR moe_balance/moe_sparsity (old)
                 ceg_bal = loss_ceg.get("ceg_balance", loss_ceg.get("moe_balance", 0.0))
                 ceg_sp = loss_ceg.get("ceg_sparsity", loss_ceg.get("moe_sparsity", 0.0))
@@ -372,7 +420,7 @@ class Net(nn.Module):
             else:
                 x0_used = x0_t
 
-            # 合成下一步 x_{t-1}
+            # åˆæˆä¸‹ä¸€æ­¥ x_{t-1}
             c1 = eta * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
             c2 = ((1 - at_next) - c1 ** 2).sqrt()
             xt_next = at_next.sqrt() * x0_used + c1 * torch.randn_like(x) + c2 * et
@@ -381,14 +429,14 @@ class Net(nn.Module):
         return xs[-1], aux_accum
 
     # -------------------------------------
-    # 可视化：给一整个 batch 生成 PGFM / CEG 中间图
+    # å¯è§†åŒ–ï¼šç»™ä¸€æ•´ä¸ª batch ç”Ÿæˆ PGFM / CEG ä¸­é—´å›¾
     # -------------------------------------
     def dump_pgfm_ceg_batch(self, low_batch, clean_batch, save_root, names):
         """
-        给定一个 batch 的低光图 low_batch 和增强结果 clean_batch（都在 [0,1]，[B,3,H,W]），
-        为 batch 里的每一张图片分别生成：
-          - debug_pgfm/<name>  ：只经过 PGFM 后的图
-          - debug_ceg/<name>   ：PGFM + CEG 后的图
+        ç»™å®šä¸€ä¸ª batch çš„ä½Žå…‰å›¾ low_batch å’Œå¢žå¼ºç»“æžœ clean_batchï¼ˆéƒ½åœ¨ [0,1]ï¼Œ[B,3,H,W]ï¼‰ï¼Œ
+        ä¸º batch é‡Œçš„æ¯ä¸€å¼ å›¾ç‰‡åˆ†åˆ«ç”Ÿæˆï¼š
+          - debug_pgfm/<name>  ï¼šåªç»è¿‡ PGFM åŽçš„å›¾
+          - debug_ceg/<name>   ï¼šPGFM + CEG åŽçš„å›¾
         """
         from torchvision.utils import save_image
 
@@ -401,7 +449,7 @@ class Net(nn.Module):
         device = clean_batch.device
         B = clean_batch.size(0)
 
-        # 统一到 [0,1]，3 通道 & 相同分辨率
+        # ç»Ÿä¸€åˆ° [0,1]ï¼Œ3 é€šé“ & ç›¸åŒåˆ†è¾¨çŽ‡
         low_01 = low_batch[:, :3, ...].clamp(0.0, 1.0)
         x0_01 = clean_batch[:, :3, ...].clamp(0.0, 1.0)
 
@@ -410,14 +458,14 @@ class Net(nn.Module):
             low_01 = F.interpolate(low_01, size=(Hf, Wf),
                                    mode='bilinear', align_corners=False)
 
-        # CTDN / RICD 教师分解，输入为 [low, clean]
+        # CTDN / RICD æ•™å¸ˆåˆ†è§£ï¼Œè¾“å…¥ä¸º [low, clean]
         pair = torch.cat([low_01, x0_01], dim=1)  # [B,6,H,W]
         with torch.no_grad():
             out_ctdn = self.decom(pair, pred_fea=None)
             teacher_R = out_ctdn["high_R"]
             teacher_L = out_ctdn["high_L"]
 
-        # L 单通道 → 3 通道；teacher 上采样到 (Hf, Wf)
+        # L å•é€šé“ â†’ 3 é€šé“ï¼›teacher ä¸Šé‡‡æ ·åˆ° (Hf, Wf)
         if teacher_L.shape[1] == 1:
             teacher_L = teacher_L.repeat(1, 3, 1, 1)
         if teacher_R.shape[-2:] != (Hf, Wf):
@@ -429,15 +477,15 @@ class Net(nn.Module):
         teacher_R = teacher_R.to(device)
         teacher_L = teacher_L.to(device)
 
-        # ====== 先走一遍 PGFM ======
+        # ====== å…ˆèµ°ä¸€é PGFM ======
         feat_in = self.enc_x(x0_01)
         feat_pgfm, _, _ = self.pgfm(feat_in, teacher_R, teacher_L)
 
-        # ====== 在 PGFM 基础上再走 CEG ======
-        t_scalar = torch.zeros(B, device=device)  # 给门控一个时间标量
+        # ====== åœ¨ PGFM åŸºç¡€ä¸Šå†èµ° CEG ======
+        t_scalar = torch.zeros(B, device=device)  # ç»™é—¨æŽ§ä¸€ä¸ªæ—¶é—´æ ‡é‡
         feat_ceg, _ = self.ceg(feat_pgfm, t_scalar=t_scalar)
 
-        # 解码并做 min-max 归一化到 [0,1]，让图更亮更易看
+        # è§£ç å¹¶åš min-max å½’ä¸€åŒ–åˆ° [0,1]ï¼Œè®©å›¾æ›´äº®æ›´æ˜“çœ‹
         x0_pgfm = self.dec_x(feat_pgfm)
         x0_ceg = self.dec_x(feat_ceg)
 
@@ -449,7 +497,7 @@ class Net(nn.Module):
         mx_ceg = x0_ceg.amax(dim=(1, 2, 3), keepdim=True)
         x0_ceg_01 = (x0_ceg - mn_ceg) / (mx_ceg - mn_ceg + 1e-8)
 
-        # 逐张保存，对应各自的文件名
+        # é€å¼ ä¿å­˜ï¼Œå¯¹åº”å„è‡ªçš„æ–‡ä»¶å
         for b in range(B):
             name = names[b]
             pgfm_path = os.path.join(pgfm_dir, name)
@@ -460,11 +508,11 @@ class Net(nn.Module):
         print(f"[DEBUG] dumped PGFM/CEG intermediates for batch to {pgfm_dir} / {ceg_dir}")
 
     # -------------------------------------
-    # 可视化：进入扩散模型之前的 R×L
+    # å¯è§†åŒ–ï¼šè¿›å…¥æ‰©æ•£æ¨¡åž‹ä¹‹å‰çš„ RÃ—L
     # -------------------------------------
     def dump_rl_before_batch(self, rl_batch, save_root, names):
         """
-        rl_batch: [B, C, H, W] in [0,1]，通常是 low_R * high_L
+        rl_batch: [B, C, H, W] in [0,1]ï¼Œé€šå¸¸æ˜¯ low_R * high_L
         """
         from torchvision.utils import save_image
 
@@ -487,14 +535,14 @@ class Net(nn.Module):
             path = os.path.join(rl_dir, names[b])
             save_image(img.detach().cpu(), path)
 
-        print(f"[DEBUG] dumped RL-before (R×L) maps to {rl_dir}")
+        print(f"[DEBUG] dumped RL-before (RÃ—L) maps to {rl_dir}")
 
     # -------------------------------------
-    # 可视化：扩散去噪后、解码器之前的 pred_fea
+    # å¯è§†åŒ–ï¼šæ‰©æ•£åŽ»å™ªåŽã€è§£ç å™¨ä¹‹å‰çš„ pred_fea
     # -------------------------------------
     def dump_predfea_before_dec_batch(self, fea_batch, save_root, names):
         """
-        fea_batch: [B, C, H, W]，通常是 inverse_data_transform 之后的 pred_fea
+        fea_batch: [B, C, H, W]ï¼Œé€šå¸¸æ˜¯ inverse_data_transform ä¹‹åŽçš„ pred_fea
         """
         from torchvision.utils import save_image
 
@@ -507,18 +555,18 @@ class Net(nn.Module):
             return
 
         B, C, H, W = fea.shape
-        # 如果不是 3 通道，简单处理一下，可视化前 3 通道或复制单通道
+        # å¦‚æžœä¸æ˜¯ 3 é€šé“ï¼Œç®€å•å¤„ç†ä¸€ä¸‹ï¼Œå¯è§†åŒ–å‰ 3 é€šé“æˆ–å¤åˆ¶å•é€šé“
         if C == 1:
             fea_vis = fea.repeat(1, 3, 1, 1)
         elif C >= 3:
             fea_vis = fea[:, :3, :, :]
         else:
-            # 理论上不会出现 C=0 等情况
+            # ç†è®ºä¸Šä¸ä¼šå‡ºçŽ° C=0 ç­‰æƒ…å†µ
             fea_vis = fea.repeat(1, 3, 1, 1)
 
         for b in range(B):
             img = fea_vis[b:b + 1]
-            # 做一次 per-image 的 min-max 归一化，提升可视对比度
+            # åšä¸€æ¬¡ per-image çš„ min-max å½’ä¸€åŒ–ï¼Œæå‡å¯è§†å¯¹æ¯”åº¦
             mn = img.amin(dim=(1, 2, 3), keepdim=True)
             mx = img.amax(dim=(1, 2, 3), keepdim=True)
             img = (img - mn) / (mx - mn + 1e-8)
@@ -536,7 +584,7 @@ class Net(nn.Module):
         b = self.betas.to(inputs.device)
 
         if self.training:
-            # ======== 训练分支 ========
+            # ======== è®­ç»ƒåˆ†æ”¯ ========
             output = self.decom(inputs, pred_fea=None)
             low_R = output["low_R"]
             low_L = output["low_L"]
@@ -561,7 +609,7 @@ class Net(nn.Module):
 
             noise_output = self.Unet(torch.cat([low_condition_norm, x], dim=1), t.float())
 
-            # 解包 (pred, aux)
+            # è§£åŒ… (pred, aux)
             pred_fea, aux_accum = self.sample_training(
                 low_condition_norm, low_img=inputs, deterministic=False
             )
@@ -575,12 +623,16 @@ class Net(nn.Module):
             data_dict["aux_loss"] = aux_accum
 
         else:
-            # ======== 推理 / 验证分支 ========
-            output = self.decom(inputs, pred_fea=None)
+            # ======== æŽ¨ç† / éªŒè¯åˆ†æ”¯ ========
+            output = self.decom(
+                inputs,
+                pred_fea=None,
+                return_pyramid=True,
+            )
             low_fea = output["low_fea"]
             low_condition_norm = utils.data_transform(low_fea)
 
-            # 进入扩散模型之前的 R×L（用于可视化）
+            # è¿›å…¥æ‰©æ•£æ¨¡åž‹ä¹‹å‰çš„ RÃ—Lï¼ˆç”¨äºŽå¯è§†åŒ–ï¼‰
             low_R = output.get("low_R", None)
             high_L = output.get("high_L", None)
             rl_before = None
@@ -595,17 +647,20 @@ class Net(nn.Module):
             )
 
             pred_fea = utils.inverse_data_transform(pred_fea)
-            # 先把 pred_fea 放进 data_dict，方便外面用
+            # å…ˆæŠŠ pred_fea æ”¾è¿› data_dictï¼Œæ–¹ä¾¿å¤–é¢ç”¨
             data_dict["pred_fea"] = pred_fea
 
-            pred_x = self.decom(inputs, pred_fea=pred_fea)["pred_img"]  # [B,3,H,W] in [0,1]
+            pred_x = self.recon_decoder(
+                pred_fea,
+                output["low_pyramid"],
+            )
             data_dict["pred_x"] = pred_x
             if rl_before is not None:
                 data_dict["rl_before"] = rl_before
 
-            # -------- 非 training 模式下：直接在这里保存中间图 --------
+            # -------- éž training æ¨¡å¼ä¸‹ï¼šç›´æŽ¥åœ¨è¿™é‡Œä¿å­˜ä¸­é—´å›¾ --------
             try:
-                # 只要不是 training 模式（如 evaluation / restoration），就保存中间可视化
+                # åªè¦ä¸æ˜¯ training æ¨¡å¼ï¼ˆå¦‚ evaluation / restorationï¼‰ï¼Œå°±ä¿å­˜ä¸­é—´å¯è§†åŒ–
                 if getattr(self.args, "mode", "") != "training":
                     save_root = getattr(self.args, "image_folder", "./results_debug")
                     B = pred_x.size(0)
@@ -615,24 +670,24 @@ class Net(nn.Module):
                         names.append(name)
                         self.debug_counter += 1
 
-                    # 1) R×L 可视化
+                    # 1) RÃ—L å¯è§†åŒ–
                     if rl_before is not None:
                         self.dump_rl_before_batch(rl_before.detach(), save_root, names)
 
-                    # 2) 扩散去噪后、解码前的 pred_fea 可视化
+                    # 2) æ‰©æ•£åŽ»å™ªåŽã€è§£ç å‰çš„ pred_fea å¯è§†åŒ–
                     self.dump_predfea_before_dec_batch(pred_fea.detach(), save_root, names)
 
-                    # 3) PGFM / CEG 中间图
+                    # 3) PGFM / CEG ä¸­é—´å›¾
                     self.dump_pgfm_ceg_batch(inputs, pred_x.detach(), save_root, names)
             except Exception as e:
-                # 出问题也不要影响推理
+                # å‡ºé—®é¢˜ä¹Ÿä¸è¦å½±å“æŽ¨ç†
                 print(f"[WARN] dump intermediates failed in forward: {e}")
 
         return data_dict
 
 
 # =========================
-# 训练封装
+# è®­ç»ƒå°è£…
 # =========================
 class DenoisingDiffusion(object):
     def __init__(self, args, config):
@@ -656,21 +711,71 @@ class DenoisingDiffusion(object):
             self.config, self.model.parameters())
         self.start_epoch, self.step = 0, 0
 
+    @staticmethod
+    def _remap_legacy_ctdn_keys(state_dict):
+        """
+        Move legacy CTDN reconstruction keys to the separated decoder.
+        Retained RICD keys keep their original names.
+        """
+        remapped = {}
+        migrated = False
+        marker = "decom.ReconNet."
+        retained_prefixes = (
+            "pyramid.",
+            "channel_down.",
+        )
+
+        for key, value in state_dict.items():
+            new_key = key
+
+            if marker in key:
+                suffix = key.split(marker, 1)[1]
+                if not suffix.startswith(retained_prefixes):
+                    new_key = key.replace(
+                        marker,
+                        "recon_decoder.",
+                        1,
+                    )
+                    migrated = True
+
+            remapped[new_key] = value
+
+        return remapped, migrated
+
     def load_ddm_ckpt(self, load_path, ema=False):
         checkpoint = utils.logging.load_checkpoint(load_path, None)
-        self.model.load_state_dict(checkpoint['state_dict'], strict=True)
 
-        if 'epoch' in checkpoint:
-            self.start_epoch = int(checkpoint['epoch'])
-        if 'step' in checkpoint:
-            self.step = int(checkpoint['step'])
+        state_dict, migrated = self._remap_legacy_ctdn_keys(
+            checkpoint["state_dict"]
+        )
+        self.model.load_state_dict(state_dict, strict=True)
 
-        if 'optimizer' in checkpoint and checkpoint['optimizer'] is not None:
-            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if "epoch" in checkpoint:
+            self.start_epoch = int(checkpoint["epoch"])
+        if "step" in checkpoint:
+            self.step = int(checkpoint["step"])
 
-        if 'ema_helper' in checkpoint and checkpoint['ema_helper'] is not None:
+        # Legacy optimizer states use the old parameter ordering.
+        if (
+            not migrated
+            and "optimizer" in checkpoint
+            and checkpoint["optimizer"] is not None
+        ):
+            self.optimizer.load_state_dict(checkpoint["optimizer"])
+        elif migrated:
+            print(
+                "[INFO] Legacy CTDN checkpoint migrated; "
+                "optimizer state was not restored."
+            )
+
+        if (
+            "ema_helper" in checkpoint
+            and checkpoint["ema_helper"] is not None
+        ):
             try:
-                self.ema_helper.load_state_dict(checkpoint['ema_helper'])
+                self.ema_helper.load_state_dict(
+                    checkpoint["ema_helper"]
+                )
                 if ema:
                     self.ema_helper.ema(self.model)
             except Exception:
@@ -678,8 +783,13 @@ class DenoisingDiffusion(object):
         elif ema:
             self.ema_helper.ema(self.model)
 
-        print("=> loaded checkpoint {} (epoch {}, step {})".format(
-            load_path, getattr(self, 'start_epoch', 0), getattr(self, 'step', 0)))
+        print(
+            "=> loaded checkpoint {} (epoch {}, step {})".format(
+                load_path,
+                getattr(self, "start_epoch", 0),
+                getattr(self, "step", 0),
+            )
+        )
 
     def train(self, DATASET):
         from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -687,25 +797,25 @@ class DenoisingDiffusion(object):
         cudnn.benchmark = True
         train_loader, val_loader = DATASET.get_loaders()
 
-        # 断点续训
+        # æ–­ç‚¹ç»­è®­
         if os.path.isfile(self.args.resume):
             self.load_ddm_ckpt(self.args.resume)
 
-        # 冻结 decom（CTDN）
+        # Freeze the Stage-I RICD teacher and reconstruction decoder
         for name, param in self.model.named_parameters():
-            if "decom" in name:
+            if "decom" in name or "recon_decoder" in name:
                 param.requires_grad = False
             else:
                 param.requires_grad = True
 
-        # ===== ETA 追踪器 =====
+        # ===== ETA è¿½è¸ªå™¨ =====
         steps_per_epoch = len(train_loader)
         total_steps = self.config.training.n_epochs * steps_per_epoch
         if not hasattr(self, "_eta_buf"):
-            self._eta_buf = deque(maxlen=200)     # 最近 200 step 的滑动平均
-            self._val_time_buf = deque(maxlen=8)  # 最近几次验证+保存耗时
+            self._eta_buf = deque(maxlen=200)     # æœ€è¿‘ 200 step çš„æ»‘åŠ¨å¹³å‡
+            self._val_time_buf = deque(maxlen=8)  # æœ€è¿‘å‡ æ¬¡éªŒè¯+ä¿å­˜è€—æ—¶
 
-        # best / early-stop / plateau（只初始化一次）
+        # best / early-stop / plateauï¼ˆåªåˆå§‹åŒ–ä¸€æ¬¡ï¼‰
         if not hasattr(self, "_best_psnr"):
             self._best_psnr = -1.0
             self._early_best = -1e9
@@ -724,7 +834,7 @@ class DenoisingDiffusion(object):
                 self.model.train()
                 self.step += 1
 
-                # step 计时开始（含 GPU 同步）
+                # step è®¡æ—¶å¼€å§‹ï¼ˆå« GPU åŒæ­¥ï¼‰
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 step_start = time.time()
@@ -735,7 +845,7 @@ class DenoisingDiffusion(object):
                 noise_loss, scc_loss = self.noise_estimation_loss(output)
                 loss = noise_loss + scc_loss
 
-                # 辅助损失：在 60% 训练进度后线性拉起到 0.03
+                # è¾…åŠ©æŸå¤±ï¼šåœ¨ 60% è®­ç»ƒè¿›åº¦åŽçº¿æ€§æ‹‰èµ·åˆ° 0.03
                 if "aux_loss" in output and output["aux_loss"] is not None:
                     ratio = self.step / float(total_steps + 1e-8)
                     if ratio < 0.6:
@@ -756,18 +866,18 @@ class DenoisingDiffusion(object):
                 elif hasattr(self, "ema"):
                     self.ema.update(self.model)
 
-                # step 计时结束（含 GPU 同步）
+                # step è®¡æ—¶ç»“æŸï¼ˆå« GPU åŒæ­¥ï¼‰
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 step_cost = time.time() - step_start
                 self._eta_buf.append(step_cost)
 
-                # === 每 10 step 打印一次 ETA ===
+                # === æ¯ 10 step æ‰“å°ä¸€æ¬¡ ETA ===
                 if self.step % 10 == 0:
                     avg_step = (sum(self._eta_buf) /
                                 len(self._eta_buf)) if len(self._eta_buf) > 0 else step_cost
                     remain_steps = max(0, total_steps - self.step)
-                    # 预估剩余会发生几次验证
+                    # é¢„ä¼°å‰©ä½™ä¼šå‘ç”Ÿå‡ æ¬¡éªŒè¯
                     vf = self.config.training.validation_freq
                     remain_validations = math.floor(
                         remain_steps / max(1, vf))
@@ -787,34 +897,34 @@ class DenoisingDiffusion(object):
 
                 data_start = time.time()
 
-                # —— 验证 / 保存 ——
+                # â€”â€” éªŒè¯ / ä¿å­˜ â€”â€”
                 if self.step % self.config.training.validation_freq == 0 and self.step != 0:
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     _val_start = time.time()
 
-                    # 1) 用 EMA 权重做验证，并抓取一份 EMA 的 state_dict
+                    # 1) ç”¨ EMA æƒé‡åšéªŒè¯ï¼Œå¹¶æŠ“å–ä¸€ä»½ EMA çš„ state_dict
                     with _EMAEvalCtx(getattr(self, "ema_helper", None) or getattr(self, "ema", None), self.model):
                         self.model.eval()
                         psnr_val = self.sample_validation_patches(
                             val_loader, self.step)
-                        # 抓取 EMA 权重（with 内参数即为 EMA）
+                        # æŠ“å– EMA æƒé‡ï¼ˆwith å†…å‚æ•°å³ä¸º EMAï¼‰
                         ema_state_dict = {k: v.detach().cpu().clone()
                                           for k, v in self.model.state_dict().items()}
                         self.model.train()
 
-                    # 2) 每次验证都保存“当步快照”（非 EMA）
+                    # 2) æ¯æ¬¡éªŒè¯éƒ½ä¿å­˜â€œå½“æ­¥å¿«ç…§â€ï¼ˆéž EMAï¼‰
                     _save_ckpt_exact({
                         'step': self.step,
                         'epoch': epoch + 1,
-                        'state_dict': self.model.state_dict(),   # 注意：此时已恢复到非 EMA
+                        'state_dict': self.model.state_dict(),   # æ³¨æ„ï¼šæ­¤æ—¶å·²æ¢å¤åˆ°éž EMA
                         'optimizer': self.optimizer.state_dict(),
                         'ema_helper': (self.ema_helper.state_dict() if hasattr(self, "ema_helper") else None),
                         'params': self.args,
                         'config': self.config
                     }, os.path.join(self.config.data.ckpt_dir, f'model_step_{self.step}.pth.tar'))
 
-                    # 3) 如果 PSNR 提升，则刷新 best（存两份：非EMA + EMA）
+                    # 3) å¦‚æžœ PSNR æå‡ï¼Œåˆ™åˆ·æ–° bestï¼ˆå­˜ä¸¤ä»½ï¼šéžEMA + EMAï¼‰
                     if not hasattr(self, "_best_psnr"):
                         self._best_psnr = -1.0
                     print(
@@ -823,22 +933,22 @@ class DenoisingDiffusion(object):
                     if psnr_val > self._best_psnr + 1e-4:
                         self._best_psnr = psnr_val
 
-                        # 3.1 最佳（非 EMA）
+                        # 3.1 æœ€ä½³ï¼ˆéž EMAï¼‰
                         _save_ckpt_exact({
                             'step': self.step,
                             'epoch': epoch + 1,
-                            'state_dict': self.model.state_dict(),   # 非 EMA
+                            'state_dict': self.model.state_dict(),   # éž EMA
                             'optimizer': self.optimizer.state_dict(),
                             'ema_helper': (self.ema_helper.state_dict() if hasattr(self, "ema_helper") else None),
                             'params': self.args,
                             'config': self.config
                         }, os.path.join(self.config.data.ckpt_dir, 'model_best_val.pth.tar'))
 
-                        # 3.2 最佳（EMA）—— 建议评测用这个
+                        # 3.2 æœ€ä½³ï¼ˆEMAï¼‰â€”â€” å»ºè®®è¯„æµ‹ç”¨è¿™ä¸ª
                         _save_ckpt_exact({
                             'step': self.step,
                             'epoch': epoch + 1,
-                            'state_dict': ema_state_dict,  # 直接存 EMA 权重
+                            'state_dict': ema_state_dict,  # ç›´æŽ¥å­˜ EMA æƒé‡
                             'optimizer': None,
                             'ema_helper': None,
                             'params': self.args,
@@ -851,18 +961,18 @@ class DenoisingDiffusion(object):
                     else:
                         self._bad_cnt += 1
 
-                    # 4) 每次验证都滚动保存 latest（非 EMA，便于断点续训）
+                    # 4) æ¯æ¬¡éªŒè¯éƒ½æ»šåŠ¨ä¿å­˜ latestï¼ˆéž EMAï¼Œä¾¿äºŽæ–­ç‚¹ç»­è®­ï¼‰
                     _save_ckpt_exact({
                         'step': self.step,
                         'epoch': epoch + 1,
-                        'state_dict': self.model.state_dict(),   # 非 EMA
+                        'state_dict': self.model.state_dict(),   # éž EMA
                         'optimizer': self.optimizer.state_dict(),
                         'ema_helper': (self.ema_helper.state_dict() if hasattr(self, "ema_helper") else None),
                         'params': self.args,
                         'config': self.config
                     }, os.path.join(self.config.data.ckpt_dir, 'model_latest.pth.tar'))
 
-                    # 记录验证耗时（ETA 用）
+                    # è®°å½•éªŒè¯è€—æ—¶ï¼ˆETA ç”¨ï¼‰
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     _val_cost = time.time() - _val_start
@@ -878,9 +988,9 @@ class DenoisingDiffusion(object):
     @torch.no_grad()
     def sample_validation_patches(self, val_loader, step):
         """
-        生成验证集结果到 <image_folder>/<step>/ 下，并返回平均 PSNR（float）
-        - 对每一张验证图，额外生成：
-            debug_pgfm/<name>  和  debug_ceg/<name>
+        ç”ŸæˆéªŒè¯é›†ç»“æžœåˆ° <image_folder>/<step>/ ä¸‹ï¼Œå¹¶è¿”å›žå¹³å‡ PSNRï¼ˆfloatï¼‰
+        - å¯¹æ¯ä¸€å¼ éªŒè¯å›¾ï¼Œé¢å¤–ç”Ÿæˆï¼š
+            debug_pgfm/<name>  å’Œ  debug_ceg/<name>
         """
         self.model.eval()
         device = self.device
@@ -888,7 +998,7 @@ class DenoisingDiffusion(object):
         save_root = os.path.join(self.args.image_folder, str(step))
         os.makedirs(save_root, exist_ok=True)
 
-        # 推断 GT 根目录：优先 val_dir/high；否则 val_dir
+        # æŽ¨æ–­ GT æ ¹ç›®å½•ï¼šä¼˜å…ˆ val_dir/highï¼›å¦åˆ™ val_dir
         gt_root = None
         if hasattr(self.config, "data") and hasattr(self.config.data, "val_dir"):
             cand = os.path.join(self.config.data.val_dir, "high")
@@ -898,49 +1008,49 @@ class DenoisingDiffusion(object):
 
         psnr_list = []
 
-        # 取到底层的 Net（DataParallel 包了一层）
+        # å–åˆ°åº•å±‚çš„ Netï¼ˆDataParallel åŒ…äº†ä¸€å±‚ï¼‰
         net = self.model.module if isinstance(
             self.model, nn.DataParallel) else self.model
 
         for bi, (x, y) in enumerate(val_loader):
             B, C, H, W = x.shape
-            # pad 到 64 的倍数
+            # pad åˆ° 64 çš„å€æ•°
             H64 = int(64 * np.ceil(H / 64.0))
             W64 = int(64 * np.ceil(W / 64.0))
             x_pad = F.pad(x, (0, W64 - W, 0, H64 - H),
                           mode='reflect').to(device, non_blocking=True)
 
-            # 前向推理
+            # å‰å‘æŽ¨ç†
             out = self.model(x_pad)
             if isinstance(out, dict) and "pred_x" in out:
                 pred = out["pred_x"]
             else:
                 pred = out
-            # 裁回原图尺寸并夹紧
+            # è£å›žåŽŸå›¾å°ºå¯¸å¹¶å¤¹ç´§
             pred = torch.clamp(pred[..., :H, :W], 0.0, 1.0)  # [B,3,H,W]
 
             # GT
             if torch.is_tensor(y):
                 gt = y.to(device, non_blocking=True)
             else:
-                assert gt_root is not None, "无法定位 GT 根目录（请检查 config.data.val_dir）"
+                assert gt_root is not None, "æ— æ³•å®šä½ GT æ ¹ç›®å½•ï¼ˆè¯·æ£€æŸ¥ config.data.val_dirï¼‰"
                 gts = []
                 for j in range(len(y)):
                     gt_j = _load_gt_tensor(y[j], gt_root)  # [3,H,W]
                     gts.append(gt_j)
                 gt = torch.stack(gts, 0).to(device)
 
-            # 尺寸对齐（裁到共同最小 H,W）
+            # å°ºå¯¸å¯¹é½ï¼ˆè£åˆ°å…±åŒæœ€å° H,Wï¼‰
             HH = min(pred.size(-2), gt.size(-2))
             WW = min(pred.size(-1), gt.size(-1))
             pred_c = pred[..., :HH, :WW]
             gt_c = gt[..., :HH, :WW]
 
-            # 计算 PSNR
+            # è®¡ç®— PSNR
             ps = _batch_psnr(pred_c, gt_c)  # [B]
             psnr_list.append(ps.detach().cpu())
 
-            # ==== 保存增强结果，同时构造每张图的文件名 ====
+            # ==== ä¿å­˜å¢žå¼ºç»“æžœï¼ŒåŒæ—¶æž„é€ æ¯å¼ å›¾çš„æ–‡ä»¶å ====
             batch_names = []
             for b in range(B):
                 if isinstance(y, (list, tuple)):
@@ -953,13 +1063,13 @@ class DenoisingDiffusion(object):
                     os.path.join(save_root, name)
                 )
 
-            # ==== 对这个 batch 额外生成 PGFM / CEG 中间图 ====
+            # ==== å¯¹è¿™ä¸ª batch é¢å¤–ç”Ÿæˆ PGFM / CEG ä¸­é—´å›¾ ====
             if hasattr(net, "dump_pgfm_ceg_batch"):
                 net.dump_pgfm_ceg_batch(
-                    x_pad.to(device),       # 低光输入（pad 后）
-                    pred.to(device),        # 增强输出
-                    save_root,              # 当前 step 子目录
-                    batch_names             # 文件名对齐
+                    x_pad.to(device),       # ä½Žå…‰è¾“å…¥ï¼ˆpad åŽï¼‰
+                    pred.to(device),        # å¢žå¼ºè¾“å‡º
+                    save_root,              # å½“å‰ step å­ç›®å½•
+                    batch_names             # æ–‡ä»¶åå¯¹é½
                 )
 
         psnr_avg = torch.cat(psnr_list, 0).mean().item() if len(psnr_list) else 0.0
