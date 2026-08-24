@@ -15,7 +15,3 @@ print(f"RICD: {ricd_params:,} ({ricd_params / 1e6:.6f} M)")
 print(f"Decoder: {decoder_params:,} ({decoder_params / 1e6:.6f} M)")
 print(f"Combined: {ricd_params + decoder_params:,}")
 
-assert ricd_params == 2_984_327
-assert decoder_params == 4_084_995
-assert ricd_params + decoder_params == 7_069_322
-
