@@ -314,6 +314,129 @@ class Retinex_decom(nn.Module):#整个增强系统中Retinex分解模块的核�
         return R, L#最终输出的是三通道的R,L反射和照明图；这就实现了一个完整的 Retinex 分解网络！
 
 
+
+class RICDEncoder(nn.Module):
+    """
+    Lightweight encoder that retains only the CTDN pathways required
+    for latent reflectance-illumination decomposition.
+    """
+    def __init__(self, channels=64):
+        super(RICDEncoder, self).__init__()
+        self.pyramid = feature_pyramid(channels)
+        self.channel_down = channel_down(channels)
+
+    def forward(self, images):
+        low_fea_down2, low_fea_down4, low_fea_down8 = \
+            self.pyramid(images[:, :3, ...])
+        low_latent = self.channel_down(low_fea_down8)
+
+        high_fea_down2, high_fea_down4, high_fea_down8 = \
+            self.pyramid(images[:, 3:, ...])
+        high_latent = self.channel_down(high_fea_down8)
+
+        low_pyramid = (
+            low_fea_down2,
+            low_fea_down4,
+            low_fea_down8,
+        )
+        return low_latent, high_latent, low_pyramid
+
+
+class RICD(nn.Module):
+    """
+    Streamlined CTDN-derived Retinex teacher.
+
+    Only the latent feature extraction, channel-down, and R/L
+    decomposition pathways are registered in this module.
+    """
+    def __init__(self, channels=64):
+        super(RICD, self).__init__()
+
+        # Preserve the original Stage-I key prefixes:
+        # ReconNet.pyramid.* and ReconNet.channel_down.*
+        self.ReconNet = RICDEncoder(channels)
+        self.retinex = Retinex_decom(channels)
+
+    def forward(self, images, pred_fea=None, return_pyramid=False):
+        if pred_fea is not None:
+            raise ValueError(
+                "RICD only performs R/L extraction. "
+                "Use ReconstructionDecoder for image reconstruction."
+            )
+
+        low_fea, high_fea, low_pyramid = self.ReconNet(images)
+
+        low_R, low_L = self.retinex(low_fea)
+        high_R, high_L = self.retinex(high_fea)
+
+        output = {
+            "low_R": low_R,
+            "low_L": low_L,
+            "low_fea": low_fea,
+            "high_R": high_R,
+            "high_L": high_L,
+            "high_fea": high_fea,
+        }
+
+        if return_pyramid:
+            output["low_pyramid"] = low_pyramid
+
+        return output
+
+
+class ReconstructionDecoder(nn.Module):
+    """
+    CTDN reconstruction pathway separated from the RICD teacher.
+    """
+    def __init__(self, channels=64):
+        super(ReconstructionDecoder, self).__init__()
+
+        self.channel_up = channel_up(channels)
+
+        self.block_up0 = Res_block(channels * 4, channels * 4)
+        self.block_up1 = Res_block(channels * 4, channels * 4)
+        self.up_sampling0 = upsampling(channels * 4, channels * 2)
+
+        self.block_up2 = Res_block(channels * 2, channels * 2)
+        self.block_up3 = Res_block(channels * 2, channels * 2)
+        self.up_sampling1 = upsampling(channels * 2, channels)
+
+        self.block_up4 = Res_block(channels, channels)
+        self.block_up5 = Res_block(channels, channels)
+        self.up_sampling2 = upsampling(channels, channels)
+
+        self.conv2 = nn.Conv2d(
+            channels, channels, kernel_size=3, stride=1, padding=1
+        )
+        self.conv3 = nn.Conv2d(
+            channels, 3, kernel_size=1, stride=1, padding=0
+        )
+        self.relu = nn.LeakyReLU()
+
+    def forward(self, pred_fea, low_pyramid):
+        low_fea_down2, low_fea_down4, low_fea_down8 = low_pyramid
+
+        pred_fea = self.channel_up(pred_fea)
+
+        pred_fea_up2 = self.up_sampling0(
+            self.block_up1(
+                self.block_up0(pred_fea) + low_fea_down8
+            )
+        )
+        pred_fea_up4 = self.up_sampling1(
+            self.block_up3(
+                self.block_up2(pred_fea_up2) + low_fea_down4
+            )
+        )
+        pred_fea_up8 = self.up_sampling2(
+            self.block_up5(
+                self.block_up4(pred_fea_up4) + low_fea_down2
+            )
+        )
+
+        return self.conv3(self.relu(self.conv2(pred_fea_up8)))
+
+
 class CTDN(nn.Module):             #它整合了两个子模块：ReconNet：图像重建网络；      Retinex_decom：图像分解网络（提取反射率 R 和光照图 L）
 
     def __init__(self, channels=64):
@@ -348,3 +471,4 @@ class CTDN(nn.Module):             #它整合了两个子模块：ReconNet：图
            
             
         return output
+
